@@ -1,0 +1,29 @@
+spring:
+  application:
+    name: transportation
+
+  datasource:
+    url: jdbc:h2:mem:testdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+    hikari:
+      maximum-pool-size: 5           # 커넥션 풀 최대 5개로 제한
+      minimum-idle: 2
+      connection-timeout: 1000       # 커넥션 대기 최대 1초 (빠른 실패)
+      idle-timeout: 30000
+      max-lifetime: 60000
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+
+logging:
+  level:
+    org.hibernate.SQL: OFF
+    org.hibernate.type.descriptor.sql.BasicBinder: OFF
+    com.resume.transportation: INFO
