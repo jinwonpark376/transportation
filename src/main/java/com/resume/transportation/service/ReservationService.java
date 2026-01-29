@@ -6,6 +6,7 @@ import com.resume.transportation.repository.ReservationRepository;
 import com.resume.transportation.repository.UserRepository;
 import com.resume.transportation.repository.VehicleRepository;
 import com.resume.transportation.service.command.CreateReservationCommand;
+import com.resume.transportation.service.ratelimit.CompositeRateLimiter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -21,15 +22,43 @@ public class ReservationService {
     private final UserRepository userRepository;
     private final TravelTimeService travelTimeService;
     private final ReservationPersistenceService persistenceService;
+    private final CompositeRateLimiter rateLimiter;
 
     /**
      * 선점 후 검증 방식의 예약 생성
      *
+     * 0. Rate Limiting (레이어드 방어)
+     *    - Layer 1: Local Semaphore (서버별 필터링)
+     *    - Layer 2: Redis 분산 락 (전역 조율)
      * 1. 기본 유효성 검증 (위치, 이동시간)
      * 2. INSERT 및 커밋 (선점) - 새로운 트랜잭션으로 즉시 커밋
      * 3. overlap 검증 - 실패 시 삭제
      */
     public Reservation createReservation(CreateReservationCommand cmd) {
+
+        // 0️⃣ Rate Limiting: 레이어드 방어 (Local Semaphore + Redis 분산 락)
+        CompositeRateLimiter.CompositeContext lockContext = null;
+        try {
+            lockContext = rateLimiter.acquire(
+                    cmd.vehicleId(),
+                    cmd.dispatcherId(),
+                    cmd.startTime(),
+                    cmd.endTime()
+            );
+
+            // 이제 DB 작업 진행
+            return doCreateReservation(cmd);
+
+        } finally {
+            // 항상 락 해제 (성공/실패 무관)
+            rateLimiter.release(lockContext);
+        }
+    }
+
+    /**
+     * 실제 예약 생성 로직 (Rate Limit 통과 후 실행)
+     */
+    private Reservation doCreateReservation(CreateReservationCommand cmd) {
 
         // 1️⃣ 해당 시간 기준 위치 검증 (Vehicle)
         Location vehicleLocationAtStart =

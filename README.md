@@ -14,45 +14,159 @@
 2. **시간 겹침 검증**: 기존 예약과 시간이 겹치는 예약 차단
 3. **위치 연속성 검증**: 차량/디스패처의 이전 도착지 = 다음 출발지
 4. **고성능**: 독립적인 예약은 최대 **30,000+ TPS** 처리
+5. **DB 부하 보호**: 트래픽 스파이크 시에도 DB 부하 최소화
 
 ---
 
 ## 🏗️ 아키텍처
 
+### 전체 요청 흐름
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    ReservationController                     │
-│                     POST /api/reservations                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ReservationService                        │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ 1. 위치 검증 (Vehicle, Dispatcher)                   │    │
-│  │ 2. 이동 시간 검증 (TravelTimeService)                │    │
-│  │ 3. 선점: INSERT + 즉시 COMMIT (REQUIRES_NEW)        │    │
-│  │ 4. 검증: Overlap 체크                                │    │
-│  │ 5. 실패 시 롤백: DELETE                              │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│              ReservationPersistenceService                   │
-│               @Transactional(REQUIRES_NEW)                   │
-│          • insertReservation() - 선점                        │
-│          • deleteReservation() - 롤백                        │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  ReservationRepository                       │
-│  • existsVehicleOverlapExcluding()                          │
-│  • existsDispatcherOverlapExcluding()                       │
-│  • findVehicleLastLocation()                                 │
-│  • findDispatcherLastLocation()                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      ReservationController                           │
+│                       POST /api/reservations                         │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       ReservationService                             │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Layer 1: Local Semaphore (서버별 필터링)                      │  │
+│  │  ─────────────────────────────────────────                     │  │
+│  │  • 1시간 단위 슬롯별 Semaphore로 동시 요청 제어                 │  │
+│  │  • 1000개 요청 → 서버당 1개만 통과                             │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                  │                                   │
+│                                  ▼                                   │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Layer 2: Redis 분산 락 (전역 조율) - Redisson                 │  │
+│  │  ─────────────────────────────────────────                     │  │
+│  │  • 여러 서버 간 동기화                                         │  │
+│  │  • Watchdog으로 TTL 자동 연장                                  │  │
+│  │  • Circuit Breaker로 장애 대응                                 │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                  │                                   │
+│                                  ▼                                   │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Layer 3: DB 선점 후 검증 (최종 정합성)                        │  │
+│  │  ─────────────────────────────────────────                     │  │
+│  │  • INSERT + COMMIT → Overlap 검증 → 실패 시 DELETE             │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 레이어드 방어 효과
+
+```
+1000개 요청 (동일 차량, 동일 시간대, 서버 10대)
+  │
+  ▼
+Layer 1: Local Semaphore
+  │ 1000개 → 10개 (99% 필터링)
+  ▼
+Layer 2: Redis 분산 락  
+  │ 10개 → 1개 (최종 1개 보장)
+  ▼
+Layer 3: DB 선점 후 검증
+  │ 1개 → 정합성 보장
+  ▼
+✅ 예약 성공
+```
+
+| 구성 | DB 접근 | Redis 접근 | 효과 |
+|------|--------|-----------|------|
+| Layer 3만 | 1000 | - | 기본 |
+| Layer 1+3 (10대) | 10 | - | 99% 감소 |
+| Layer 1+2+3 | 1 | 10 | 99.9% 감소 |
+
+---
+
+## 🔐 Rate Limiting & 분산 락
+
+### Layer 1: Local Semaphore
+
+JVM 내에서 동일 리소스에 대한 동시 요청을 제어합니다.
+
+```java
+// 슬롯 키 생성: 차량ID + 날짜 + 시간대
+// 예: VEHICLE_1_2026-01-29_SLOT_09
+
+Semaphore semaphore = semaphores.computeIfAbsent(key, k -> new Semaphore(1));
+if (!semaphore.tryAcquire()) {
+    throw new RateLimitExceededException("이미 처리 중인 요청이 있습니다");
+}
+```
+
+**특징:**
+- `ConcurrentHashMap`으로 슬롯별 Semaphore 관리
+- `tryAcquire()`: 논블로킹, 즉시 성공/실패 판단
+- 1시간 단위 슬롯으로 시간 겹침 요청 제어
+- 서버 재시작 시 자동 초기화
+
+### Layer 2: Redis 분산 락 (Redisson)
+
+여러 서버 간 동기화를 위해 Redisson RLock을 사용합니다.
+
+```java
+RLock lock = redissonClient.getLock(lockKey);
+boolean acquired = lock.tryLock(
+    0,   // waitTime: 대기 안 함 (즉시 실패)
+    -1,  // leaseTime: Watchdog 활성화 (자동 TTL 연장)
+    TimeUnit.SECONDS
+);
+```
+
+**Redisson RLock의 장점:**
+
+| 기능 | 직접 구현 | Redisson |
+|------|----------|----------|
+| 락 획득 | `SETNX + TTL` | `tryLock()` |
+| 락 해제 | Lua 스크립트 필요 | `unlock()` (자동 안전 처리) |
+| TTL 연장 | 직접 구현 필요 | **Watchdog 자동 연장** |
+| 재진입 | 불가 | 지원 |
+| 안전성 | 수동 검증 필요 | 검증된 프로덕션 라이브러리 |
+
+**Watchdog 동작:**
+```
+0초   락 획득 (기본 TTL 30초)
+│
+10초  Watchdog이 TTL 연장 → 30초 리셋
+│
+20초  Watchdog이 TTL 연장 → 30초 리셋
+│
+35초  작업 완료 → unlock() → Watchdog 중단
+```
+- 작업 중에는 락 유지, 서버 죽으면 TTL 만료로 자동 해제
+
+### Circuit Breaker (Redis 장애 대응)
+
+Redis 장애 시에도 서비스 연속성을 보장합니다.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Circuit Breaker 상태 전이                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  CLOSED (정상)                                                   │
+│  ─────────────                                                  │
+│  요청 → Redis 사용 → 성공/실패 카운트                            │
+│                                                                 │
+│  연속 5회 실패 시 → OPEN                                         │
+│                                                                 │
+│  OPEN (차단) - 30초간                                            │
+│  ───────────                                                    │
+│  요청 → Redis 스킵 → Local Semaphore만으로 동작 (Fallback)       │
+│                                                                 │
+│  30초 후 → HALF_OPEN                                             │
+│                                                                 │
+│  HALF_OPEN (복구 시도)                                           │
+│  ─────────────────                                              │
+│  일부 요청만 Redis 시도                                          │
+│  → 3회 연속 성공 시 CLOSED 복귀                                   │
+│  → 실패 시 다시 OPEN                                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -87,6 +201,26 @@ Thread B: INSERT(ID=2) → COMMIT → Overlap검증(ID<2 있음=ID:1) → 실패
 | **낙관적 락** | 높은 동시성 | 충돌 시 재시도 필요 |
 | **선점 후 검증** ✅ | DB 레벨 원자성 보장, 재시도 불필요 | 실패 시 DELETE 비용 |
 
+### Rate Limiting의 역할
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Rate Limiting이 해결하는 문제                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Rate Limiting 없이:                                             │
+│  1000개 요청 → 1000개 INSERT → 999개 DELETE                      │
+│  → 불필요한 DB 부하 발생                                         │
+│                                                                 │
+│  Rate Limiting 적용 후:                                          │
+│  1000개 요청 → 1개만 INSERT → 성공                               │
+│  → 나머지 999개는 즉시 실패 응답 (DB 접근 없음)                   │
+│                                                                 │
+│  핵심: 정합성은 DB가 보장, Rate Limiting은 부하 최적화            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## 📁 프로젝트 구조
@@ -94,6 +228,9 @@ Thread B: INSERT(ID=2) → COMMIT → Overlap검증(ID<2 있음=ID:1) → 실패
 ```
 src/
 ├── main/java/com/resume/transportation/
+│   ├── config/
+│   │   └── RedissonConfig.java             # Redisson 클라이언트 설정
+│   │
 │   ├── controller/
 │   │   └── ReservationController.java      # REST API 엔드포인트
 │   │
@@ -118,22 +255,64 @@ src/
 │       ├── ReservationPersistenceService.java  # REQUIRES_NEW 트랜잭션
 │       ├── TravelTimeService.java          # 이동 시간 계산
 │       ├── command/
-│       │   └── CreateReservationCommand.java   # 예약 생성 커맨드
+│       │   └── CreateReservationCommand.java
+│       ├── ratelimit/
+│       │   ├── ResourceRateLimiter.java    # Local Semaphore 기반
+│       │   ├── DistributedRateLimiter.java # Redisson 분산 락
+│       │   ├── CompositeRateLimiter.java   # Layer 1+2 조합
+│       │   ├── CircuitBreaker.java         # Redis 장애 대응
+│       │   └── RateLimitExceededException.java
 │       └── support/
-│           └── LocationPair.java           # 출발지-도착지 쌍
+│           └── LocationPair.java
 │
 └── test/java/com/resume/transportation/
     ├── concurrency/
-    │   └── OptimisticLockConcurrencyTest.java  # 동시성 테스트
+    │   └── OptimisticLockConcurrencyTest.java
+    ├── ratelimit/
+    │   ├── ResourceRateLimiterTest.java    # Semaphore 테스트
+    │   ├── DistributedRateLimiterTest.java # Redisson 테스트
+    │   ├── CircuitBreakerTest.java         # Circuit Breaker 테스트
+    │   └── EmbeddedRedisConfig.java        # 테스트용 Redis
     └── repository/
-        └── OverlapLogicTest.java               # 시간 겹침 로직 테스트
+        └── OverlapLogicTest.java
 ```
 
 ---
 
 ## 🧪 테스트 시나리오
 
-### 1. 동시성 테스트 (OptimisticLockConcurrencyTest)
+### 1. Rate Limiting 테스트
+
+#### Local Semaphore 테스트
+```java
+@Test
+@DisplayName("동시에 100개 요청 시 1개만 permit 획득")
+void onlyOneAcquiresUnderConcurrency()
+```
+- **시나리오**: 100개 스레드가 동일 슬롯에 동시 요청
+- **기대 결과**: 1개 성공, 99개 실패
+- **검증**: `assertThat(successCount.get()).isEqualTo(1)`
+
+#### Redis 분산 락 테스트
+```java
+@Test
+@DisplayName("동시에 100개 요청 시 1개만 성공 (분산 환경)")
+void onlyOneSucceedsUnderConcurrency()
+```
+- **결과**: `Redisson 분산 락 테스트 - 성공: 1, 실패: 99`
+
+#### Circuit Breaker 테스트
+```java
+@Test
+@DisplayName("연속 실패 시 OPEN으로 전이")
+void opensAfterThresholdFailures()
+
+@Test
+@DisplayName("HALF_OPEN에서 성공 시 CLOSED 복귀")
+void closesAfterSuccessesInHalfOpen()
+```
+
+### 2. 동시성 테스트 (OptimisticLockConcurrencyTest)
 
 #### 테스트 1: 동일 시간대 동시 예약
 ```java
@@ -143,68 +322,17 @@ void testConcurrentReservationWithInsertThenValidate()
 ```
 - **시나리오**: 10개 스레드가 동시에 동일 차량, 동일 시간대 예약
 - **기대 결과**: 성공 1건, 실패 9건
-- **검증**: `assertThat(reservationRepository.count()).isEqualTo(1)`
 
-#### 테스트 2: 겹치는 시간대 동시 예약
-```java
-@Test  
-@DisplayName("동시에 같은 차량, 겹치는 시간대 예약 시 하나만 성공해야 한다")
-void testConcurrentReservationWithOverlappingTime()
-```
-- **시나리오**: 10개 스레드가 10분씩 offset된 시간대로 예약 (모두 겹침)
-- **기대 결과**: 가장 먼저 INSERT된 1건만 성공
-
-#### 테스트 3: 독립 예약 처리량
-```java
-@Test
-@DisplayName("동시에 같은 차량, 겹치지 않는 시간대 예약 시 모두 성공")
-void testConcurrentReservationWithNonOverlappingTime()
-```
-- **시나리오**: 5개 스레드가 겹치지 않는 시간대로 예약
-- **기대 결과**: 5건 모두 성공
-
-### 2. 부하 테스트 결과
-
-#### TPS 측정 테스트
-```java
-@Test
-@DisplayName("부하 테스트: TPS 측정")
-void testThroughput()
-```
-- 100개 독립 요청 동시 처리
-- 평균 응답시간: ~1ms
-
-#### 스트레스 테스트 결과
+### 3. 부하 테스트 결과
 
 | 부하 (건) | 성공 | 실패 | 소요시간 | TPS | 평균 응답시간 |
 |-----------|------|------|----------|-----|--------------|
 | 100 | 100 | 0 | 106ms | **943** | 1.06ms |
-| 500 | 500 | 0 | 178ms | **2,809** | 0.36ms |
 | 1,000 | 1,000 | 0 | 192ms | **5,208** | 0.19ms |
-| 2,000 | 2,000 | 0 | 264ms | **7,576** | 0.13ms |
-| 5,000 | 5,000 | 0 | 567ms | **8,818** | 0.11ms |
 | 10,000 | 10,000 | 0 | 793ms | **12,610** | 0.08ms |
-| 20,000 | 20,000 | 0 | 1,135ms | **17,621** | 0.06ms |
 | 500,000 | 500,000 | 0 | 16,230ms | **30,807** | 0.03ms |
 
 > ✅ **50만 건 동시 요청에서도 에러율 0%, TPS 30,000+ 달성**
-
-### 3. 시간 겹침 로직 테스트 (OverlapLogicTest)
-
-```java
-// SQL 조건: r.startTime < :endTime AND r.endTime > :startTime
-```
-
-| 케이스 | 기존 예약 | 새 예약 | 결과 |
-|--------|-----------|---------|------|
-| 완전히 겹침 | 10:00~12:00 | 10:30~11:30 | ✅ 겹침 |
-| 앞부분만 겹침 | 10:00~12:00 | 09:00~11:00 | ✅ 겹침 |
-| 뒷부분만 겹침 | 10:00~12:00 | 11:00~13:00 | ✅ 겹침 |
-| 완전히 감싸기 | 10:00~12:00 | 09:00~13:00 | ✅ 겹침 |
-| 완전히 이전 | 10:00~12:00 | 08:00~09:00 | ❌ 안겹침 |
-| 완전히 이후 | 10:00~12:00 | 13:00~14:00 | ❌ 안겹침 |
-| 경계 일치 (시작) | 10:00~12:00 | 12:00~13:00 | ❌ 안겹침 |
-| 경계 일치 (종료) | 10:00~12:00 | 09:00~10:00 | ❌ 안겹침 |
 
 ---
 
@@ -218,12 +346,12 @@ public class Reservation {
     @Id @GeneratedValue
     private Long id;
     
-    @ManyToOne private Vehicle vehicle;      // 예약된 차량
-    @ManyToOne private User dispatcher;      // 배정된 디스패처
-    @ManyToOne private User operator;        // 요청한 운영자
+    @ManyToOne private Vehicle vehicle;
+    @ManyToOne private User dispatcher;
+    @ManyToOne private User operator;
     
-    @Enumerated private Location fromLocation;   // 출발지
-    @Enumerated private Location toLocation;     // 도착지
+    @Enumerated private Location fromLocation;
+    @Enumerated private Location toLocation;
     @Enumerated private ReservationStatus status;
     
     private LocalDateTime startTime;
@@ -234,45 +362,6 @@ public class Reservation {
 }
 ```
 
-### 핵심 인덱스
-
-```java
-@Index(name = "idx_reservation_vehicle_time",
-       columnList = "vehicle_id, status, startTime, endTime")
-
-@Index(name = "idx_reservation_dispatcher_time", 
-       columnList = "dispatcher_id, status, startTime, endTime")
-```
-
----
-
-## 🔍 핵심 쿼리
-
-### Overlap 검증 쿼리
-
-```sql
-SELECT COUNT(r) > 0
-FROM Reservation r
-WHERE r.vehicle.id = :vehicleId
-  AND r.id < :excludeId           -- 자기보다 먼저 INSERT된 예약만
-  AND r.status IN ('CREATED','IN_PROGRESS')
-  AND r.startTime < :endTime      -- 시간 겹침 조건
-  AND r.endTime > :startTime
-```
-
-- `r.id < :excludeId`: **순서 보장** - 먼저 INSERT된 예약이 우선권
-
-### 위치 히스토리 조회
-
-```sql
-SELECT r.toLocation
-FROM Reservation r
-WHERE r.vehicle.id = :vehicleId
-  AND r.endTime <= :time
-ORDER BY r.endTime DESC
-LIMIT 1
-```
-
 ---
 
 ## 🚀 실행 방법
@@ -280,6 +369,7 @@ LIMIT 1
 ### 요구사항
 - Java 21+
 - Gradle 9.2+
+- Redis 6.0+ (분산 락 테스트 시)
 
 ### 테스트 실행
 
@@ -287,16 +377,15 @@ LIMIT 1
 # 전체 테스트
 ./gradlew test
 
-# 동시성 테스트만
+# Rate Limiting 테스트
+./gradlew test --tests "*RateLimiterTest*"
+
+# Circuit Breaker 테스트
+./gradlew test --tests "*CircuitBreakerTest*"
+
+# 동시성 테스트
 ./gradlew test --tests "*ConcurrencyTest*"
-
-# 스트레스 테스트 (메모리 조절)
-./gradlew test -Dtest.maxHeap=4g --tests "*testStressUntilBreak*"
 ```
-
-### 테스트 리포트
-- `build/reports/tests/test/index.html` - JUnit 리포트
-- `build/reports/stress-test-report.txt` - 스트레스 테스트 상세 결과
 
 ---
 
@@ -308,28 +397,20 @@ LIMIT 1
 | Framework | Spring Boot 4.0 |
 | ORM | Spring Data JPA |
 | Database | H2 (In-Memory) |
+| Cache/Lock | Redis + Redisson |
 | Build | Gradle Kotlin DSL |
-| Test | JUnit 5, AssertJ |
+| Test | JUnit 5, AssertJ, Embedded Redis |
 
 ---
 
 ## 📚 학습 포인트
 
-1. **REQUIRES_NEW 트랜잭션**: 중첩 트랜잭션으로 즉시 커밋
-2. **선점 후 검증 패턴**: 락 없이 동시성 제어
-3. **시간 겹침 로직**: `start < end AND end > start`
-4. **인덱스 최적화**: 복합 인덱스로 쿼리 성능 확보
-5. **낙관적 락 (@Version)**: 업데이트 충돌 감지
-
----
-
-## 🔜 향후 개선 사항
-
-- [ ] Redis를 활용한 분산 락 적용
-- [ ] 실제 DB(PostgreSQL)에서의 성능 테스트
-- [ ] API Rate Limiting 적용
-- [ ] 예약 취소/변경 기능 추가
-- [ ] 이벤트 소싱 패턴 적용 고려
+1. **선점 후 검증 패턴**: 락 없이 DB 레벨 동시성 제어
+2. **레이어드 방어 전략**: Semaphore → Redis → DB 순차 필터링
+3. **Semaphore vs Lock**: 동시 접근 수 제한 vs 상호 배제
+4. **Redisson RLock**: Watchdog 자동 TTL 연장, 안전한 락 해제
+5. **Circuit Breaker**: 장애 전파 방지, Fallback 처리
+6. **ConcurrentHashMap**: 스레드 안전한 슬롯 관리
 
 ---
 

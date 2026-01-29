@@ -27,6 +27,11 @@ spring:
             log:
               LOG_QUERIES_SLOWER_THAN_MS: 100
 
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
 logging:
   level:
     org.hibernate.SQL: DEBUG
