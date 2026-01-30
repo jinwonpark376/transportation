@@ -2,25 +2,32 @@ spring:
   application:
     name: transportation
   
+  # ============================================
+  # MySQL 설정
+  # ============================================
   datasource:
-    url: jdbc:h2:mem:testdb
-    driver-class-name: org.h2.Driver
-    username: sa
-    password:
-  
-  h2:
-    console:
-      enabled: true
-      path: /h2-console
-  
+    url: jdbc:mysql://localhost:3306/transportation?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: app
+    password: app123
+    hikari:
+      pool-name: HikariCP-Transportation
+      maximum-pool-size: 20          # 커넥션 풀 최대 크기
+      minimum-idle: 5                # 최소 유휴 커넥션
+      connection-timeout: 3000       # 커넥션 획득 대기 시간 (3초)
+      idle-timeout: 600000           # 유휴 커넥션 유지 시간 (10분)
+      max-lifetime: 1800000          # 커넥션 최대 수명 (30분)
+      leak-detection-threshold: 60000  # 커넥션 누수 감지 (1분)
+
   jpa:
     hibernate:
-      ddl-auto: create-drop
+      ddl-auto: update
     show-sql: true
     properties:
       hibernate:
         format_sql: true
         use_sql_comments: true
+        dialect: org.hibernate.dialect.MySQLDialect
         # 슬로우 쿼리 로깅 (100ms 이상)
         session:
           events:
@@ -31,9 +38,53 @@ spring:
     redis:
       host: localhost
       port: 6379
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+
+# ============================================
+# Actuator + Prometheus 설정
+# ============================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    export:
+      prometheus:
+        enabled: true
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      percentiles:
+        http.server.requests: 0.5, 0.75, 0.95, 0.99
+
+# ============================================
+# Server 설정
+# ============================================
+server:
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    accept-count: 100
+    max-connections: 8192
 
 logging:
   level:
     org.hibernate.SQL: DEBUG
     org.hibernate.type.descriptor.sql.BasicBinder: TRACE
     com.resume.transportation: DEBUG
+    com.zaxxer.hikari: DEBUG

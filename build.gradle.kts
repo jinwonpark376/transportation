@@ -23,13 +23,32 @@ dependencies {
 	implementation("org.springframework.boot:spring-boot-starter-webmvc")
 	implementation("org.springframework.boot:spring-boot-starter-data-redis")
 	implementation("org.redisson:redisson:3.40.2")
+	
+	// ============================================
+	// Monitoring: Prometheus + Micrometer
+	// ============================================
+	implementation("org.springframework.boot:spring-boot-starter-actuator")
+	implementation("io.micrometer:micrometer-registry-prometheus")
+	
+	// ============================================
+	// Database
+	// ============================================
+	runtimeOnly("com.mysql:mysql-connector-j")          // MySQL
+	runtimeOnly("com.h2database:h2")                    // H2 (테스트용)
+	
+	// ============================================
+	// Test
+	// ============================================
 	testImplementation("org.springframework.boot:spring-boot-starter-data-jpa-test")
 	testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
 	testImplementation("com.github.codemonstur:embedded-redis:1.4.3")
+	testImplementation("org.testcontainers:testcontainers:1.19.3")
+	testImplementation("org.testcontainers:mysql:1.19.3")
+	testImplementation("org.testcontainers:junit-jupiter:1.19.3")
 	testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+	
 	compileOnly("org.projectlombok:lombok")
 	annotationProcessor("org.projectlombok:lombok")
-	runtimeOnly("com.h2database:h2") // 또는 PostgreSQL/MySQL
 }
 
 tasks.withType<Test> {

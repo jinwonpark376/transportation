@@ -7,6 +7,8 @@ import com.resume.transportation.repository.UserRepository;
 import com.resume.transportation.repository.VehicleRepository;
 import com.resume.transportation.service.command.CreateReservationCommand;
 import com.resume.transportation.service.ratelimit.CompositeRateLimiter;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -23,6 +25,14 @@ public class ReservationService {
     private final TravelTimeService travelTimeService;
     private final ReservationPersistenceService persistenceService;
     private final CompositeRateLimiter rateLimiter;
+    
+    // ============================================
+    // Metrics
+    // ============================================
+    private final Counter reservationCreateCounter;
+    private final Counter reservationFailedCounter;
+    private final Timer lockAcquireTimer;
+    private final Timer dbOverlapCheckTimer;
 
     /**
      * 선점 후 검증 방식의 예약 생성
@@ -39,16 +49,24 @@ public class ReservationService {
         // 0️⃣ Rate Limiting: 레이어드 방어 (Local Semaphore + Redis 분산 락)
         CompositeRateLimiter.CompositeContext lockContext = null;
         try {
-            lockContext = rateLimiter.acquire(
+            // 락 획득 시간 측정
+            lockContext = lockAcquireTimer.record(() -> 
+                rateLimiter.acquire(
                     cmd.vehicleId(),
                     cmd.dispatcherId(),
                     cmd.startTime(),
                     cmd.endTime()
+                )
             );
 
             // 이제 DB 작업 진행
-            return doCreateReservation(cmd);
+            Reservation reservation = doCreateReservation(cmd);
+            reservationCreateCounter.increment();
+            return reservation;
 
+        } catch (Exception e) {
+            reservationFailedCounter.increment();
+            throw e;
         } finally {
             // 항상 락 해제 (성공/실패 무관)
             rateLimiter.release(lockContext);
@@ -104,18 +122,20 @@ public class ReservationService {
         // 4️⃣ 예약 생성 및 저장 (선점) - 별도 트랜잭션으로 즉시 커밋
         Reservation reservation = persistenceService.insertReservation(cmd);
 
-        // 5️⃣ 선점 성공 후 overlap 검증
+        // 5️⃣ 선점 성공 후 overlap 검증 (시간 측정)
         // 자기 자신을 제외하고 시간이 겹치는 예약이 있는지 확인
         try {
-            if (reservationRepository.existsVehicleOverlapExcluding(
-                    cmd.vehicleId(), reservation.getId(), cmd.startTime(), cmd.endTime())) {
-                throw new IllegalStateException("차량이 해당 시간에 이미 예약되어 있습니다.");
-            }
+            dbOverlapCheckTimer.record(() -> {
+                if (reservationRepository.existsVehicleOverlapExcluding(
+                        cmd.vehicleId(), reservation.getId(), cmd.startTime(), cmd.endTime())) {
+                    throw new IllegalStateException("차량이 해당 시간에 이미 예약되어 있습니다.");
+                }
 
-            if (reservationRepository.existsDispatcherOverlapExcluding(
-                    cmd.dispatcherId(), reservation.getId(), cmd.startTime(), cmd.endTime())) {
-                throw new IllegalStateException("디스패처가 해당 시간에 이미 배정되어 있습니다.");
-            }
+                if (reservationRepository.existsDispatcherOverlapExcluding(
+                        cmd.dispatcherId(), reservation.getId(), cmd.startTime(), cmd.endTime())) {
+                    throw new IllegalStateException("디스패처가 해당 시간에 이미 배정되어 있습니다.");
+                }
+            });
         } catch (IllegalStateException e) {
             // overlap 발견 → 선점했던 예약 삭제
             persistenceService.deleteReservation(reservation.getId());

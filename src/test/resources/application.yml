@@ -27,3 +27,41 @@ logging:
     org.hibernate.SQL: OFF
     org.hibernate.type.descriptor.sql.BasicBinder: OFF
     com.resume.transportation: INFO
+
+---
+# ============================================
+# Load Test Profile (MySQL + Redis via Testcontainers)
+# ============================================
+spring:
+  config:
+    activate:
+      on-profile: loadtest
+
+  datasource:
+    # Testcontainers가 동적으로 설정
+    hikari:
+      pool-name: HikariCP-LoadTest
+      maximum-pool-size: 30          # 부하 테스트용 증가
+      minimum-idle: 10
+      connection-timeout: 5000       # 5초
+      idle-timeout: 60000
+      max-lifetime: 300000
+      leak-detection-threshold: 30000
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
+
+logging:
+  level:
+    org.hibernate.SQL: OFF
+    com.resume.transportation: INFO
+    com.zaxxer.hikari: INFO
