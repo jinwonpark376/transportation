@@ -1,0 +1,48 @@
+# Prometheus 설정
+global:
+  scrape_interval: 5s      # 메트릭 수집 주기
+  evaluation_interval: 5s  # Rule 평가 주기
+
+# Alertmanager 설정 (선택사항)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # ============================================
+  # Spring Boot Application (Actuator)
+  # ============================================
+  - job_name: 'spring-boot-app'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+        labels:
+          application: 'transportation'
+    # 연결 실패 시에도 계속 시도
+    scrape_timeout: 10s
+
+  # ============================================
+  # MySQL Exporter
+  # ============================================
+  - job_name: 'mysql'
+    static_configs:
+      - targets: ['mysql-exporter:9104']
+        labels:
+          db: 'transportation'
+
+  # ============================================
+  # Redis Exporter
+  # ============================================
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          cache: 'transportation'
+
+  # ============================================
+  # Prometheus 자체 모니터링
+  # ============================================
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
