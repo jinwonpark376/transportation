@@ -48,7 +48,7 @@ echo "3️⃣ 부하 테스트 시작..."
 echo ""
 
 # 시작 시간
-START_TIME=$(date +%s%3N)
+START_TIME=$(python3 -c "import time; print(int(time.time() * 1000))")
 
 # 차량/디스패처 배열로 변환
 IFS=',' read -ra VEHICLES <<< "$VEHICLE_IDS"
@@ -110,7 +110,7 @@ done
 wait
 
 # 종료 시간
-END_TIME=$(date +%s%3N)
+END_TIME=$(python3 -c "import time; print(int(time.time() * 1000))")
 DURATION=$((END_TIME - START_TIME))
 
 echo ""
